@@ -1,0 +1,36 @@
+# docker-compose de la rama 01-monolito.
+#
+# Solo dos contenedores: la app (monolito con los 6 módulos) y su base
+# PostgreSQL. No hay Traefik todavía: el PRD §7 reserva el API gateway
+# y el balanceo para cuando existan varios servicios/copias que
+# repartir (rama 02-separacion), y en esta etapa solo hay un proceso
+# atendiendo todo.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kubermates
+      POSTGRES_PASSWORD: kubermates
+      POSTGRES_DB: kubermates
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kubermates"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: ./app
+    environment:
+      DATABASE_URL: postgresql://kubermates:kubermates@db:5432/kubermates
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
