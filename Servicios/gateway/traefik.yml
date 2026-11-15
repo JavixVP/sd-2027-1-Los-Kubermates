@@ -1,0 +1,19 @@
+entryPoints:
+  web:
+    address: ":8080"
+  traefik:
+    address: ":8081"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: kubertickets
+    watch: true
+
+api:
+  dashboard: true
+  insecure: true
+
+log:
+  level: INFO
