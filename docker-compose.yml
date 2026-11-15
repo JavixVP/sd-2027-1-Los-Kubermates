@@ -1,0 +1,228 @@
+# Sistema de gestion de boletos y reservaciones de eventos — Los Kubermates
+# Un solo comando: docker compose up --build -d
+#
+# Piezas (ver PRD, secciones 6-8):
+#   - traefik (puerto 8080): UNICA puerta de entrada. El cliente solo conoce
+#     http://localhost:8080/api/... Traefik descubre los servicios leyendo las etiquetas
+#     de Docker (no hay directorio dinamico tipo Eureka: direcciones fijas de Compose).
+#   - db (Postgres): una base por servicio (usuarios, eventos, reservas, pagos, boletos),
+#     creadas por db/init/01-crear-bases.sql.
+#   - mongo: base documental de Notificaciones (mensajes enviados y su estado).
+#   - reservas: UNICO servicio con replicas (3). Concentra la mayor concurrencia: varios
+#     usuarios compitiendo por los ultimos lugares de un mismo evento. Traefik reparte las
+#     solicitudes entre sus copias en round robin.
+#   - El resto de los servicios (usuarios, eventos, pagos, boletos, notificaciones) corren
+#     con una sola copia: atienden consultas o pasos posteriores a una compra ya confirmada,
+#     con menor concurrencia critica (PRD seccion 7).
+#
+# Flujo de compra (orquestado por reservas, llamadas HTTP directas y sincronas):
+#   reservas -> pagos (con timeout) -> boletos -> notificaciones
+
+name: kubertickets
+
+x-servicio: &servicio
+  environment: &entorno-base
+    DB_HOST: db
+    DB_PORT: "5432"
+    DB_USER: kubertickets
+    DB_PASSWORD: kubertickets
+  depends_on:
+    db:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/salud')\" || exit 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 15s
+  networks:
+    - kubertickets
+
+services:
+  # UN solo Postgres con UNA base por servicio (las crea db/init/01-crear-bases.sql).
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: kubertickets
+      POSTGRES_PASSWORD: kubertickets
+    volumes:
+      - datos_postgres:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Por TCP y no por socket: mientras corre el script de init, Postgres solo escucha en el
+      # socket local. Asi `db` no se declara sano antes de que existan las bases de cada servicio.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U kubertickets -d boletos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - kubertickets
+
+  # Base documental de Notificaciones (PRD seccion 7: "un caso de uso mas documental").
+  mongo:
+    image: mongo:8.0
+    volumes:
+      - datos_mongo:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - kubertickets
+
+  # La unica puerta hacia afuera. Lee las etiquetas de los contenedores para saber a donde
+  # mandar cada solicitud; no hay directorio dinamico (PRD seccion 7).
+  traefik:
+    image: traefik:v3.7.19
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "127.0.0.1:${PUERTO_GATEWAY:-8080}:8080"
+      - "127.0.0.1:${PUERTO_DASHBOARD:-8081}:8081"
+    volumes:
+      # Sin ":ro": en Docker Desktop para Windows/Mac (WSL2), el proxy que expone el
+      # socket dentro del contenedor falla ("Error response from daemon: ", vacío) si
+      # el bind mount es de solo lectura, aunque Traefik solo haga llamadas de lectura.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./gateway/traefik.yml:/etc/traefik/traefik.yml:ro
+    depends_on:
+      usuarios:
+        condition: service_healthy
+      eventos:
+        condition: service_healthy
+      reservas:
+        condition: service_healthy
+    networks:
+      - kubertickets
+
+  usuarios:
+    <<: *servicio
+    build: ./usuarios
+    environment:
+      <<: *entorno-base
+      DB_NAME: usuarios
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.usuarios.rule=PathPrefix(`/api/usuarios`)"
+      - "traefik.http.routers.usuarios.entrypoints=web"
+      - "traefik.http.middlewares.usuarios-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.usuarios.middlewares=usuarios-strip"
+      - "traefik.http.services.usuarios.loadbalancer.server.port=8000"
+
+  eventos:
+    <<: *servicio
+    build: ./eventos
+    environment:
+      <<: *entorno-base
+      DB_NAME: eventos
+      RESERVAS_URL: http://reservas:8000
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.eventos.rule=PathPrefix(`/api/eventos`)"
+      - "traefik.http.routers.eventos.entrypoints=web"
+      - "traefik.http.middlewares.eventos-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.eventos.middlewares=eventos-strip"
+      - "traefik.http.services.eventos.loadbalancer.server.port=8000"
+
+  # El unico servicio con varias copias: concentra la concurrencia critica sobre el cupo
+  # disponible (PRD seccion 4 y 7). El bloqueo pesimista vive en SU base compartida, no en
+  # memoria de una copia, porque las tres consultan y modifican los mismos datos.
+  reservas:
+    <<: *servicio
+    build: ./reservas
+    deploy:
+      replicas: 3
+    environment:
+      <<: *entorno-base
+      DB_NAME: reservas
+      EVENTOS_URL: http://eventos:8000
+      USUARIOS_URL: http://usuarios:8000
+      PAGOS_URL: http://pagos:8000
+      BOLETOS_URL: http://boletos:8000
+      NOTIFICACIONES_URL: http://notificaciones:8000
+      # Tiempo que una reservacion aparta el lugar antes de expirar (PRD seccion 4: 10 min).
+      RESERVA_TTL_SEGUNDOS: ${RESERVA_TTL_SEGUNDOS:-600}
+      # Cada cuanto el barrido interno busca reservaciones vencidas y boletos pendientes de reintento.
+      BARRIDO_SEGUNDOS: ${BARRIDO_SEGUNDOS:-5}
+      # Limite de espera de la llamada sincrona a Pagos (PRD seccion 7: "no debe esperar indefinidamente").
+      TIMEOUT_PAGOS_SEGUNDOS: ${TIMEOUT_PAGOS_SEGUNDOS:-5}
+      TIMEOUT_BOLETOS_SEGUNDOS: ${TIMEOUT_BOLETOS_SEGUNDOS:-5}
+      TIMEOUT_NOTIFICACIONES_SEGUNDOS: ${TIMEOUT_NOTIFICACIONES_SEGUNDOS:-5}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.reservas.rule=PathPrefix(`/api/reservas`)"
+      - "traefik.http.routers.reservas.entrypoints=web"
+      - "traefik.http.middlewares.reservas-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.reservas.middlewares=reservas-strip"
+      - "traefik.http.services.reservas.loadbalancer.server.port=8000"
+
+  # Pagos simulados (PRD seccion 3: fuera de alcance procesar pagos reales). No llama a nadie.
+  pagos:
+    <<: *servicio
+    build: ./pagos
+    environment:
+      <<: *entorno-base
+      DB_NAME: pagos
+
+  # Generacion de boletos digitales. No llama a nadie; Reservas reintenta si falla.
+  boletos:
+    <<: *servicio
+    build: ./boletos
+    environment:
+      <<: *entorno-base
+      DB_NAME: boletos
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.boletos.rule=PathPrefix(`/api/boletos`) && Method(`GET`)"
+      - "traefik.http.routers.boletos.entrypoints=web"
+      - "traefik.http.middlewares.boletos-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.boletos.middlewares=boletos-strip"
+      - "traefik.http.services.boletos.loadbalancer.server.port=8000"
+
+  # Notificaciones al usuario. Usa Mongo (base documental) en vez de Postgres.
+  notificaciones:
+    build: ./notificaciones
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: notificaciones
+      BARRIDO_SEGUNDOS: ${BARRIDO_SEGUNDOS:-5}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/salud')\" || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    networks:
+      - kubertickets
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.notificaciones.rule=PathPrefix(`/api/notificaciones`) && Method(`GET`)"
+      - "traefik.http.routers.notificaciones.entrypoints=web"
+      - "traefik.http.middlewares.notificaciones-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.notificaciones.middlewares=notificaciones-strip"
+      - "traefik.http.services.notificaciones.loadbalancer.server.port=8000"
+
+  # Interfaz web: sitio estático de varias páginas (nginx) que consume la API a
+  # través de Traefik (http://localhost:8080/api/...). Se publica en su propio
+  # puerto, fuera de Traefik, para no competir con las reglas /api/* del gateway.
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${PUERTO_FRONTEND:-3000}:80"
+    depends_on:
+      - traefik
+    networks:
+      - kubertickets
+
+networks:
+  kubertickets:
+    name: kubertickets
+
+volumes:
+  datos_postgres:
+  datos_mongo:
